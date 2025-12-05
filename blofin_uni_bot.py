@@ -19,7 +19,7 @@ CSV_FILE = "uni_blofin_history.csv"
 
 # ========== Trading Configuration ==========
 INITIAL_BALANCE = 10000
-LEVERAGE = 5
+LEVERAGE = 3
 POSITION_SIZE_RATIO = 0.4
 INTERVAL = "1H"
 FEE_PERCENT = 0.0006
