@@ -687,14 +687,14 @@ class AutoTradeBot:
         history_str = "[" + ", ".join(history_list) + "]"
 
         last_pnl = closed['pnl'].iloc[-1]
-        last_pnl_percent = (last_pnl / last_position_usdt) * 100 * LEVERAGE if last_position_usdt != 0 else 0.0
+        # last_pnl_percent = (last_pnl / last_position_usdt) * 100 * LEVERAGE if last_position_usdt != 0 else 0.0
 
         payload = {
-            "ticker": "ETH-USDT",
+            "ticker": "UNI-USDT",
             "action": "stats",
             "time": datetime.now(timezone.utc).isoformat(),
             "PNL": str(round(total_pnl_percent, 2)),
-            "LastPNL": str(round(last_pnl_percent, 2)),
+            "LastPNL": str(round(last_pnl, 2)),
             "MaxDraw": str(round(abs(max_drawdown_pct), 2)),
             "WinRate": str(round(winrate, 2)),
             "DailyPNL": str(round(today_pnl, 2)),
