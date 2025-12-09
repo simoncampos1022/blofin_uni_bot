@@ -20,7 +20,7 @@ CSV_FILE = "uni_blofin_history.csv"
 # ========== Trading Configuration ==========
 INITIAL_BALANCE = 10000
 LEVERAGE = 3
-POSITION_SIZE_RATIO = 0.4
+# POSITION_SIZE_RATIO = 0.4
 INTERVAL = "1H"
 FEE_PERCENT = 0.0006
 ATR_LENGTH = 14
@@ -463,7 +463,7 @@ class AutoTradeBot:
                 print("[TRADE] Failed to fetch current price for open position.")
                 return
             
-            size = round((self.balance * POSITION_SIZE_RATIO * LEVERAGE) / price, 4)
+            size = round((3000 * LEVERAGE) / price, 4)
 
             current_time = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
