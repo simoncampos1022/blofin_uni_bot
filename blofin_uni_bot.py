@@ -463,7 +463,7 @@ class AutoTradeBot:
                 print("[TRADE] Failed to fetch current price for open position.")
                 return
             
-            size = round((3000 * LEVERAGE) / price, 4)
+            size = round((6000 * LEVERAGE) / price, 4)
 
             current_time = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
