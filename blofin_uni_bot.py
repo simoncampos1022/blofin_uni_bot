@@ -8,856 +8,795 @@ import threading
 from queue import Queue
 import pandas as pd
 
-# ========== Constants ==========
-BITGET_TICKERS_URL = "https://api.bitget.com/api/v2/mix/market/tickers"
-BITGET_CANDLE_URL = "https://api.bitget.com/api/v2/mix/market/history-candles"
-WEBHOOK_URL = "https://api.primeautomation.ai/webhook/ChartPrime/52ff03d4-f744-4d9a-8f77-1e9791bb1731"
+API_TICKER_ENDPOINT = "https://api.bitget.com/api/v2/mix/market/tickers"
+API_CANDLE_ENDPOINT = "https://api.bitget.com/api/v2/mix/market/history-candles"
+NOTIFICATION_WEBHOOK = "https://api.primeautomation.ai/webhook/ChartPrime/52ff03d4-f744-4d9a-8f77-1e9791bb1731"
 
-UNIUSDT_SYMBOL = "UNIUSDT"
-PRODUCT_TYPE = "USDT-FUTURES"
-CSV_FILE = "uni_blofin_history.csv"
+TRADING_PAIR = "UNIUSDT"
+CONTRACT_TYPE = "USDT-FUTURES"
+HISTORY_FILE = "uni_blofin_history.csv"
 
-# ========== Trading Configuration ==========
-INITIAL_BALANCE = 10000
-LEVERAGE = 3
-# POSITION_SIZE_RATIO = 0.4
-INTERVAL = "1H"
-FEE_PERCENT = 0.0006
-ATR_LENGTH = 14
-FS_LENGTH = 10
-RSI_LENGTH = 14
+STARTING_CAPITAL = 10000
+MULTIPLIER = 3
+TIMEFRAME = "1H"
+TRANSACTION_FEE = 0.0006
+ATR_PERIOD = 14
+FS_PERIOD = 10
+RSI_PERIOD = 14
 
-LONG_FS_ENTRY_LEVEL = 1.1
-LONG_RSI_ENTRY_LEVEL = 28.0
-LONG_STOP_LOSS_LEVEL = 2.9
-LONG_TAKE_PROFIT_LEVEL = 1.1
-LONG_SECOND_SL_LEVEL = 0.1
+LONG_FS_THRESHOLD = 1.1
+LONG_RSI_THRESHOLD = 28.0
+LONG_SL_MULTIPLIER = 2.9
+LONG_TP_MULTIPLIER = 1.1
+LONG_TRAILING_SL_MULTIPLIER = 0.1
 
-SHORT_FS_ENTRY_LEVEL = 4.7
-SHORT_RSI_ENTRY_LEVEL = 1.0
-SHORT_STOP_LOSS_LEVEL = 2.9
-SHORT_TAKE_PROFIT_LEVEL = 2.0
-SHORT_SECOND_SL_LEVEL = 0.1
+SHORT_FS_THRESHOLD = 4.7
+SHORT_RSI_THRESHOLD = 1.0
+SHORT_SL_MULTIPLIER = 2.9
+SHORT_TP_MULTIPLIER = 2.0
+SHORT_TRAILING_SL_MULTIPLIER = 0.1
 
-class AutoTradeBot:
+class TradingEngine:
     def __init__(self):
-        self.flag_webhook_sent = True
-        self.balance = INITIAL_BALANCE
-        self.running = True
-        self.trade_lock = threading.Lock()
-        self.price_lock = threading.Lock()
-        self.candles = []
-        self.fs = []
-        self.tr = []
-        self.total_trades = 1
-        self.trades = []
-        self.current_price = None
-        self.price_queue = Queue()
-        self.price_update_event = threading.Event()
-        self.current_long_position = None
-        self.current_short_position = None
-        self.current_atr_value = 0.0
-        self.current_vol_os = 0.0
-        self.current_rsi_value = 0.0
-        self.start_date = datetime(2025, 12, 1, tzinfo=timezone.utc)
+        self.enable_notifications = True
+        self.account_balance = STARTING_CAPITAL
+        self.is_active = True
+        self.execution_lock = threading.Lock()
+        self.quote_lock = threading.Lock()
+        self.ohlc_data = []
+        self.fisher_series = []
+        self.trigger_line = []
+        self.trade_counter = 1
+        self.trade_history = []
+        self.latest_quote = None
+        self.quote_queue = Queue()
+        self.quote_update_event = threading.Event()
+        self.active_long = None
+        self.active_short = None
+        self.atr_current = 0.0
+        self.volume_osc = 0.0
+        self.rsi_current = 0.0
+        self.launch_date = datetime(2025, 12, 1, tzinfo=timezone.utc)
         
-        # Initialize current price via REST API
-        self.current_price = self.get_current_price()
-        if self.current_price is None:
-            print("[INIT] Initial price from REST: None")
+        self.latest_quote = self.fetch_latest_quote()
+        if self.latest_quote is None:
+            print("Initial price from REST: None")
         else:
-            print(f"[INIT] Initial price from REST: ${self.current_price:.4f}")
+            print(f"Initial price from REST: ${self.latest_quote:.4f}")
         
-        # Load existing trades from CSV
-        if os.path.exists(CSV_FILE):
+        if os.path.exists(HISTORY_FILE):
             try:
-                with open(CSV_FILE, 'r') as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        trade_data = {
-                            'entry_time': row['entry_time'],
-                            'exit_time': row['exit_time'],
-                            'action': row['action'],
-                            'entry_price': float(row['entry_price']),
-                            'exit_price': float(row['exit_price']) if row['exit_price'].strip() else None,
-                            'size': float(row['size']),
-                            'status': row['status'],
-                            'pnl': float(row['pnl']) if row['pnl'] else 0.0,
-                            'fee': float(row.get('fee', 0.0)),
-                            'ideal_pnl': float(row.get('ideal_pnl', 0.0)),
-                            'reason': row.get('reason', ''),
-                            'stop_loss': float(row.get('stop_loss', 0.0)),
-                            'take_profit': float(row.get('take_profit', 0.0)),
-                            'max_profit_price': float(row.get('max_profit_price', 0.0)),
-                            'trailing_stop_active': row.get('trailing_stop_active', 'False') == 'True',
-                            'half_exit_done': row.get('half_exit_done', 'False') == 'True',
-                            'original_size': float(row.get('original_size', float(row['size']))),
+                with open(HISTORY_FILE, 'r') as file_handle:
+                    csv_reader = csv.DictReader(file_handle)
+                    for record in csv_reader:
+                        order_data = {
+                            'entry_time': record['entry_time'],
+                            'exit_time': record['exit_time'],
+                            'action': record['action'],
+                            'entry_price': float(record['entry_price']),
+                            'exit_price': float(record['exit_price']) if record['exit_price'].strip() else None,
+                            'size': float(record['size']),
+                            'status': record['status'],
+                            'pnl': float(record['pnl']) if record['pnl'] else 0.0,
+                            'fee': float(record.get('fee', 0.0)),
+                            'ideal_pnl': float(record.get('ideal_pnl', 0.0)),
+                            'reason': record.get('reason', ''),
+                            'stop_loss': float(record.get('stop_loss', 0.0)),
+                            'take_profit': float(record.get('take_profit', 0.0)),
+                            'max_profit_price': float(record.get('max_profit_price', 0.0)),
+                            'trailing_stop_active': record.get('trailing_stop_active', 'False') == 'True',
+                            'half_exit_done': record.get('half_exit_done', 'False') == 'True',
+                            'original_size': float(record.get('original_size', float(record['size']))),
                         }
-                        self.trades.append(trade_data)
-                        self.total_trades = len(self.trades)
+                        self.trade_history.append(order_data)
+                        self.trade_counter = len(self.trade_history)
                         
-                        # Restore open positions
-                        if trade_data['status'] == 'open':
-                            if trade_data['action'] == 'long':
-                                self.current_long_position = trade_data
-                            elif trade_data['action'] == 'short':
-                                self.current_short_position = trade_data
+                        if order_data['status'] == 'open':
+                            if order_data['action'] == 'long':
+                                self.active_long = order_data
+                            elif order_data['action'] == 'short':
+                                self.active_short = order_data
             except Exception as e:
-                print(f"[INIT] Error loading trades from CSV: {e}")
+                print(f"Error loading trades from CSV: {e}")
 
-        # Start background threads
-        threading.Thread(target=self.strategy_loop, daemon=True).start()
-        threading.Thread(target=self.monitor_positions, daemon=True).start()
+        threading.Thread(target=self.main_loop, daemon=True).start()
+        threading.Thread(target=self.watch_positions, daemon=True).start()
 
-    # ========== Data Fetching & Indicators ==========
-    def get_current_price(self):
+    def fetch_latest_quote(self):
         try:
-            params = {
-                "symbol": UNIUSDT_SYMBOL,
-                "productType": PRODUCT_TYPE,
+            request_params = {
+                "symbol": TRADING_PAIR,
+                "productType": CONTRACT_TYPE,
             }
-            response = requests.get(BITGET_TICKERS_URL, params=params, timeout=10)
-            data = response.json()
+            api_response = requests.get(API_TICKER_ENDPOINT, params=request_params, timeout=10)
+            response_data = api_response.json()
             
-            if data['code'] != '00000':
-                print(f"[REST] API Error: {data['msg']}")
+            if response_data['code'] != '00000':
+                print(f"API Error: {response_data['msg']}")
                 return None
                 
-            # Find SOLUSDT ticker
-            for ticker in data['data']:
-                if ticker['symbol'] == UNIUSDT_SYMBOL:
-                    price = float(ticker['lastPr'])
-                    print(f"[REST] Fetched price: ${price:.4f}")
-                    return price
+            for item in response_data['data']:
+                if item['symbol'] == TRADING_PAIR:
+                    quote = float(item['lastPr'])
+                    print(f"Fetched price: ${quote:.4f}")
+                    return quote
                     
-            print(f"[REST] SOLUSDT symbol not found in response")
+            print(f"Current USDT symbol not found in response")
             return None
             
         except Exception as e:
-            print(f"[REST] Price fetch error: {e}")
+            print(f"Price fetch error: {e}")
             return None
 
-    def fetch_candles(self, interval: str, limit: int):
+    def retrieve_ohlc(self, timeframe: str, limit: int):
         
-        params = {
-            "symbol": UNIUSDT_SYMBOL,
-            "productType": PRODUCT_TYPE,
-            "granularity": interval,
+        request_params = {
+            "symbol": TRADING_PAIR,
+            "productType": CONTRACT_TYPE,
+            "granularity": timeframe,
             "limit": limit
         }
         try:
-            response = requests.get(BITGET_CANDLE_URL, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
+            api_response = requests.get(API_CANDLE_ENDPOINT, params=request_params, timeout=10)
+            api_response.raise_for_status()
+            response_data = api_response.json()
             
-            if data['code'] != '00000':
-                print(f"[DATA] API Error: {data['msg']}")
+            if response_data['code'] != '00000':
+                print(f"API Error: {response_data['msg']}")
                 return None
                 
-            data = data.get("data", [])
-            candles = []
-            for entry in data:
+            response_data = response_data.get("data", [])
+            ohlc_list = []
+            for candle_entry in response_data:
                 candle = {
-                    "timestamp": datetime.fromtimestamp(int(entry[0]) / 1000, timezone.utc),
-                    "open": float(entry[1]),
-                    "high": float(entry[2]),
-                    "low": float(entry[3]),
-                    "close": float(entry[4]),
-                    "volume": float(entry[5]),
-                    "quote_volume": float(entry[6])
+                    "timestamp": datetime.fromtimestamp(int(candle_entry[0]) / 1000, timezone.utc),
+                    "open": float(candle_entry[1]),
+                    "high": float(candle_entry[2]),
+                    "low": float(candle_entry[3]),
+                    "close": float(candle_entry[4]),
+                    "volume": float(candle_entry[5]),
+                    "quote_volume": float(candle_entry[6])
                 }
-                candles.append(candle)
-            print(f"[DATA] Fetched {len(candles)} {interval} candles")
-            return candles
+                ohlc_list.append(candle)
+            print(f"Fetched {len(ohlc_list)} {timeframe} candles")
+            return ohlc_list
         except Exception as e:
-            print(f"[DATA] Error fetching candles: {e}")
+            print(f"Error fetching candles: {e}")
             return None
         
-    def calculate_atr(self, df, atr_length=14):
-        high = df['high']
-        low = df['low']
-        close = df['close']
-        tr1 = high - low
-        tr2 = (high - close.shift(1)).abs()
-        tr3 = (low - close.shift(1)).abs()
+    def compute_atr(self, dataframe, period=14):
+        high_price = dataframe['high']
+        low_price = dataframe['low']
+        close_price = dataframe['close']
+        tr1 = high_price - low_price
+        tr2 = (high_price - close_price.shift(1)).abs()
+        tr3 = (low_price - close_price.shift(1)).abs()
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        # Wilder's moving average (RMA) uses ewm with alpha = 1/period
-        atr = tr.ewm(alpha=1/atr_length, adjust=False, min_periods=atr_length).mean()
-        df['atr'] = atr.fillna(0)
-        return df
+        atr = tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+        dataframe['atr'] = atr.fillna(0)
+        return dataframe
     
-    def calculate_volume_oscillator(self, df):
-        df = pd.DataFrame(df)
-        vol_ema5 = df['volume'].ewm(span=5, adjust=False).mean()
-        vol_ema10 = df['volume'].ewm(span=10, adjust=False).mean()
+    def compute_volume_osc(self, dataframe):
+        dataframe = pd.DataFrame(dataframe)
+        vol_ema5 = dataframe['volume'].ewm(span=5, adjust=False).mean()
+        vol_ema10 = dataframe['volume'].ewm(span=10, adjust=False).mean()
         vol_osc = (vol_ema5 - vol_ema10) / vol_ema10 * 100
-        df['vol_os'] = vol_osc.fillna(0)
-        return df
+        dataframe['vol_os'] = vol_osc.fillna(0)
+        return dataframe
     
-    # ========== RSI Calculation ==========
-    def calculate_rsi(self, df, rsi_length=RSI_LENGTH):
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).ewm(alpha=1/rsi_length, adjust=False, min_periods=rsi_length).mean()
-        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/rsi_length, adjust=False, min_periods=rsi_length).mean()
-        rs = gain / loss
-        df['rsi'] = 100 - (100 / (1 + rs))
-        df['rsi'] = df['rsi'].fillna(50)
-        return df
+    def compute_rsi(self, dataframe, period=RSI_PERIOD):
+        price_change = dataframe['close'].diff()
+        positive_change = (price_change.where(price_change > 0, 0)).ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+        negative_change = (-price_change.where(price_change < 0, 0)).ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+        relative_strength = positive_change / negative_change
+        dataframe['rsi'] = 100 - (100 / (1 + relative_strength))
+        dataframe['rsi'] = dataframe['rsi'].fillna(50)
+        return dataframe
     
-    def calculate_fs(self, df, fs_length=FS_LENGTH):
-        high = df['high'].values
-        low = df['low'].values
-        median = (high + low) / 2
-        value = np.zeros(len(median))
-        fs = np.zeros(len(median))
-        tr = np.zeros(len(median))
+    def compute_fisher(self, dataframe, period=FS_PERIOD):
+        high_price = dataframe['high'].values
+        low_price = dataframe['low'].values
+        mid_price = (high_price + low_price) / 2
+        fisher_value = np.zeros(len(mid_price))
+        fs = np.zeros(len(mid_price))
+        tr = np.zeros(len(mid_price))
         
-        # Initialize first values
-        value[0] = 0
+        fisher_value[0] = 0
         fs[0] = 0
         tr[0] = 0
         
-        for i in range(1, len(median)):
-            if i < fs_length:
-                # Not enough data for full window, use simple calculation
-                window = median[:i+1]
-                max_h = np.max(window)
-                min_l = np.min(window)
+        for i in range(1, len(mid_price)):
+            if i < period:
+                lookback_window = mid_price[:i+1]
+                window_high = np.max(lookback_window)
+                window_low = np.min(lookback_window)
             else:
-                window = median[i-fs_length+1:i+1]
-                max_h = np.max(window)
-                min_l = np.min(window)
+                lookback_window = mid_price[i-period+1:i+1]
+                window_high = np.max(lookback_window)
+                window_low = np.min(lookback_window)
             
-            if max_h != min_l:
-                val = 0.33 * 2 * ((median[i] - min_l)/(max_h - min_l) - 0.5) + 0.67 * value[i-1]
-                val = np.clip(val, -0.999, 0.999)
-                value[i] = val
-                fs[i] = 0.5 * np.log((1 + val)/(1 - val)) + 0.5 * fs[i-1]
+            if window_high != window_low:
+                computed_value = 0.33 * 2 * ((mid_price[i] - window_low)/(window_high - window_low) - 0.5) + 0.67 * fisher_value[i-1]
+                computed_value = np.clip(computed_value, -0.999, 0.999)
+                fisher_value[i] = computed_value
+                fs[i] = 0.5 * np.log((1 + computed_value)/(1 - computed_value)) + 0.5 * fs[i-1]
                 tr[i] = fs[i-1]
             else:
-                value[i] = 0
+                fisher_value[i] = 0
                 fs[i] = fs[i-1]
                 tr[i] = tr[i-1]
         
-        df['fs'] = fs
-        df['tr'] = tr
-        return df
+        dataframe['fs'] = fs
+        dataframe['tr'] = tr
+        return dataframe
     
-    def update_trailing_stop(self, current_price, position):
-        if not position:
+    def adjust_trailing_sl(self, current_quote, holding):
+        if not holding:
             return
         
-        take_profit = position['take_profit']
+        target_price = holding['take_profit']
 
-        if 'max_profit_price' not in position:
-            position['max_profit_price'] = position['entry_price']
-            position['trailing_stop_active'] = False
+        if 'max_profit_price' not in holding:
+            holding['max_profit_price'] = holding['entry_price']
+            holding['trailing_stop_active'] = False
 
-        changed = False  # track if we update anything
+        was_updated = False
 
-        if position['action'] == 'long':
-            if current_price > position['max_profit_price']:
-                position['max_profit_price'] = current_price
-                changed = True
-                print(f"[TRAILING STOP] New max profit price for LONG: ${position['max_profit_price']:.4f}")
+        if holding['action'] == 'long':
+            if current_quote > holding['max_profit_price']:
+                holding['max_profit_price'] = current_quote
+                was_updated = True
+                print(f"New max profit price for LONG: ${holding['max_profit_price']:.4f}")
 
-            if not position.get('half_exit_done', False) and current_price >= take_profit:
-                self.execute_half_exit(position, current_price)
-                position['trailing_stop_active'] = True
-                changed = True
+            if not holding.get('half_exit_done', False) and current_quote >= target_price:
+                self.partial_close(holding, current_quote)
+                holding['trailing_stop_active'] = True
+                was_updated = True
 
-            if position['trailing_stop_active']:
-                trailing_stop_price = position['max_profit_price'] - (self.current_atr_value * LONG_SECOND_SL_LEVEL)
-                if trailing_stop_price > position['stop_loss']:
-                    position['stop_loss'] = trailing_stop_price
-                    changed = True
-                    print(f"[TRAILING STOP] Updated stop loss for LONG: ${position['stop_loss']:.4f}")
+            if holding['trailing_stop_active']:
+                trailing_sl = holding['max_profit_price'] - (self.atr_current * LONG_TRAILING_SL_MULTIPLIER)
+                if trailing_sl > holding['stop_loss']:
+                    holding['stop_loss'] = trailing_sl
+                    was_updated = True
+                    print(f"Updated stop loss for LONG: ${holding['stop_loss']:.4f}")
 
-        else:  # short
-            if current_price < position['max_profit_price']:
-                position['max_profit_price'] = current_price
-                changed = True
-                print(f"[TRAILING STOP] New max profit price for SHORT: ${position['max_profit_price']:.4f}")
+        else:
+            if current_quote < holding['max_profit_price']:
+                holding['max_profit_price'] = current_quote
+                was_updated = True
+                print(f"New max profit price for SHORT: ${holding['max_profit_price']:.4f}")
 
-            if not position.get('half_exit_done', False) and current_price <= take_profit:
-                self.execute_half_exit(position, current_price)
-                position['trailing_stop_active'] = True
-                changed = True
+            if not holding.get('half_exit_done', False) and current_quote <= target_price:
+                self.partial_close(holding, current_quote)
+                holding['trailing_stop_active'] = True
+                was_updated = True
 
-            if position['trailing_stop_active']:
-                trailing_stop_price = position['max_profit_price'] + (self.current_atr_value * SHORT_SECOND_SL_LEVEL)
-                if trailing_stop_price < position['stop_loss']:
-                    position['stop_loss'] = trailing_stop_price
-                    changed = True
-                    print(f"[TRAILING STOP] Updated stop loss for SHORT: ${position['stop_loss']:.4f}")
+            if holding['trailing_stop_active']:
+                trailing_sl = holding['max_profit_price'] + (self.atr_current * SHORT_TRAILING_SL_MULTIPLIER)
+                if trailing_sl < holding['stop_loss']:
+                    holding['stop_loss'] = trailing_sl
+                    was_updated = True
+                    print(f"Updated stop loss for SHORT: ${holding['stop_loss']:.4f}")
 
-        if changed:
-            self.save_trades()
+        if was_updated:
+            self.persist_trades()
 
-    def execute_half_exit(self, position, current_price):
-        """Execute half position exit and update position size"""
-        with self.trade_lock:
-            if position.get('half_exit_done', False):
-                print(f"[HALF EXIT] Half exit already executed for {position['action'].upper()} position")
+    def partial_close(self, holding, current_quote):
+        with self.execution_lock:
+            if holding.get('half_exit_done', False):
+                print(f"Half exit already executed for {holding['action'].upper()} position")
                 return
 
-            # Store original size if not already stored
-            if 'original_size' not in position:
-                position['original_size'] = position['size']
+            if 'original_size' not in holding:
+                holding['original_size'] = holding['size']
 
-            # Calculate half size to close
-            half_size = position['size'] / 2
-            remaining_size = position['size'] - half_size
+            partial_quantity = holding['size'] / 2
+            remaining_quantity = holding['size'] - partial_quantity
 
-            # Calculate PnL for the half position
-            if position['action'] == 'long':
-                pnl = (current_price - position['entry_price']) * half_size
+            if holding['action'] == 'long':
+                profit_loss = (current_quote - holding['entry_price']) * partial_quantity
             else:
-                pnl = (position['entry_price'] - current_price) * half_size
+                profit_loss = (holding['entry_price'] - current_quote) * partial_quantity
 
-            fee = (current_price + position['entry_price']) * FEE_PERCENT * half_size
-            net_pnl = pnl - fee
+            commission = (current_quote + holding['entry_price']) * TRANSACTION_FEE * partial_quantity
+            net_profit = profit_loss - commission
 
-            # Update balance
-            self.balance += net_pnl
+            self.account_balance += net_profit
 
-            # Create a closed trade record for the half exit
-            half_trade = {
-                'entry_time': position['entry_time'],
+            partial_order = {
+                'entry_time': holding['entry_time'],
                 'exit_time': datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-                'action': position['action'],
-                'entry_price': position['entry_price'],
-                'exit_price': current_price,
-                'size': half_size,
+                'action': holding['action'],
+                'entry_price': holding['entry_price'],
+                'exit_price': current_quote,
+                'size': partial_quantity,
                 'status': 'closed',
-                'pnl': net_pnl,
-                'fee': fee,
-                'ideal_pnl': pnl,
+                'pnl': net_profit,
+                'fee': commission,
+                'ideal_pnl': profit_loss,
                 'reason': 'half_exit_take_profit',
-                'stop_loss': position['stop_loss'],
-                'take_profit': position['take_profit'],
-                'max_profit_price': position.get('max_profit_price', position['entry_price']),
+                'stop_loss': holding['stop_loss'],
+                'take_profit': holding['take_profit'],
+                'max_profit_price': holding.get('max_profit_price', holding['entry_price']),
                 'trailing_stop_active': False,
                 'half_exit_done': True,
-                'original_size': position['original_size']
+                'original_size': holding['original_size']
             }
 
-            # Update the original position
-            position['size'] = remaining_size
-            position['half_exit_done'] = True
-            position['trailing_stop_active'] = True
+            holding['size'] = remaining_quantity
+            holding['half_exit_done'] = True
+            holding['trailing_stop_active'] = True
 
-            # Add the half exit trade to trades list
-            self.trades.append(half_trade)
+            self.trade_history.append(partial_order)
 
-            # Send webhook for half exit
-            self.send_webhook(f'exit_{position["action"]}', current_price, half_size, 50)
+            self.notify_webhook(f'exit_{holding["action"]}', current_quote, partial_quantity, 50)
 
-            print(f"[HALF EXIT] 🔵 Executed half exit for {position['action'].upper()} position | "
-                  f"Exit Price: ${current_price:.4f} | "
-                  f"Half Size: {half_size:.4f} | "
-                  f"Remaining Size: {remaining_size:.4f} | "
-                  f"PNL: ${net_pnl:.4f}")
+            print(f"Executed half exit for {holding['action']} position")
 
-            self.save_trades()
-            self.send_daily_pnl_signal()
+            self.persist_trades()
+            self.broadcast_performance()
 
-    def update_indicators(self):
-        new_candles = self.fetch_candles(INTERVAL, 200)
-        if not new_candles:
-            print("[DATA] No new candles fetched. Using existing data.")
+    def refresh_indicators(self):
+        fresh_ohlc = self.retrieve_ohlc(TIMEFRAME, 200)
+        if not fresh_ohlc:
+            print("No new candles fetched. Using existing data.")
             return
             
-        self.candles = sorted(new_candles, key=lambda x: x['timestamp'])
-        print(f"[INDICATORS] Updating with {len(self.candles)} candles")
+        self.ohlc_data = sorted(fresh_ohlc, key=lambda x: x['timestamp'])
+        print(f"Updating with {len(self.ohlc_data)} candles")
 
-        df = pd.DataFrame(self.candles)
+        dataframe = pd.DataFrame(self.ohlc_data)
 
-        df = self.calculate_fs(df, FS_LENGTH)
-        df = self.calculate_volume_oscillator(df)
-        df = self.calculate_atr(df, ATR_LENGTH)
-        df = self.calculate_rsi(df, RSI_LENGTH)
+        dataframe = self.compute_fisher(dataframe, FS_PERIOD)
+        dataframe = self.compute_volume_osc(dataframe)
+        dataframe = self.compute_atr(dataframe, ATR_PERIOD)
+        dataframe = self.compute_rsi(dataframe, RSI_PERIOD)
 
-        self.fs = df['fs'].tolist()
-        self.tr = df['tr'].tolist()
-        self.current_vol_os = df['vol_os'].iloc[-1]
-        self.current_atr_value = df['atr'].iloc[-1]
-        self.current_rsi_value = df['rsi'].iloc[-1]
+        self.fisher_series = dataframe['fs'].tolist()
+        self.trigger_line = dataframe['tr'].tolist()
+        self.volume_osc = dataframe['vol_os'].iloc[-1]
+        self.atr_current = dataframe['atr'].iloc[-1]
+        self.rsi_current = dataframe['rsi'].iloc[-1]
 
-        print(f"[INDICATORS] Updated FS: {self.fs[-1]:.4f}, TR: {self.tr[-1]:.4f}, "
-            f"VOL_OS: {self.current_vol_os:.4f}, ATR_VAL: {self.current_atr_value:.4f}, "
-            f"RSI_VALUE: {self.current_rsi_value:.4f}")
+        print(f"Updated FS: {self.fisher_series[-1]:.4f}, TR: {self.trigger_line[-1]:.4f}, VOL_OS: {self.volume_osc:.4f}, ATR_VAL: {self.atr_current:.4f}, RSI_VALUE: {self.rsi_current:.4f}")
 
-    # ========== Trading Logic ==========
-    def check_signal(self, current_time: str):
-        if len(self.fs) < 3:
-            print("[SIGNAL] Not enough data to check signals")
+    def evaluate_signals(self, timestamp: str):
+        if len(self.fisher_series) < 3:
+            print("Not enough data to check signals")
             return
         
-        fs_now = self.fs[-1]
-        tr_now = self.tr[-1]
-        print(f"[{current_time}] 1H indicator values now fs:{fs_now:.4f}, tr:{tr_now:.4f}")
+        fisher_current = self.fisher_series[-1]
+        trigger_current = self.trigger_line[-1]
+        print(f"1H indicator values now fs:{fisher_current:.4f}, tr:{trigger_current:.4f}")
         
-        fs_prev = self.fs[-2]
-        tr_prev = self.tr[-2]
-        print(f"[{current_time}] 1H indicator values prev fs:{fs_prev:.4f}, tr:{tr_prev:.4f}")
+        fisher_previous = self.fisher_series[-2]
+        trigger_previous = self.trigger_line[-2]
+        print(f"1H indicator values prev fs:{fisher_previous:.4f}, tr:{trigger_previous:.4f}")
 
-        fs_cross_up = (fs_prev < tr_prev) and (fs_now > tr_now)
-        fs_cross_down = (fs_prev > tr_prev) and (fs_now < tr_now)
+        bullish_cross = (fisher_previous < trigger_previous) and (fisher_current > trigger_current)
+        bearish_cross = (fisher_previous > trigger_previous) and (fisher_current < trigger_current)
 
-        current_price = self.get_current_price()
-        if current_price is None:
-            print("[SIGNAL] Cannot get current price, skipping signal check")
+        current_quote = self.fetch_latest_quote()
+        if current_quote is None:
+            print("Cannot get current price, skipping signal check")
             return
 
-        if fs_cross_up:
+        if bullish_cross:
             print(f"UP cross is detected!")
-        if fs_cross_down:
+        if bearish_cross:
             print(f"DOWN cross is detected!")
         
-        if fs_cross_up:
-            cond_entry = abs(self.current_rsi_value - 50) < LONG_RSI_ENTRY_LEVEL
-            cond_entry_fs = max(abs(tr_now), abs(fs_now)) < LONG_FS_ENTRY_LEVEL
-            cond_vol = self.current_vol_os > 0
+        if bullish_cross:
+            entry_condition = abs(self.rsi_current - 50) < LONG_RSI_THRESHOLD
+            fs_condition = max(abs(trigger_current), abs(fisher_current)) < LONG_FS_THRESHOLD
+            volume_condition = self.volume_osc > 0
             
-            print(f"[SIGNAL] LONG Conditions - RSI: {cond_entry}, FS: {cond_entry_fs}, VOL: {cond_vol}")
+            print(f"LONG Conditions - RSI: {entry_condition}, FS: {fs_condition}, VOL: {volume_condition}")
             
-            if cond_entry and cond_entry_fs and cond_vol:
-                if self.current_long_position:
-                    if current_price < self.current_long_position['entry_price']:
-                        self.close_position('long', "Replace")
-                        self.open_position('long')
+            if entry_condition and fs_condition and volume_condition:
+                if self.active_long:
+                    if current_quote < self.active_long['entry_price']:
+                        self.exit_position('long', "Replace")
+                        self.enter_position('long')
                     else:
                         pass
                 else:
-                    self.open_position('long')
+                    self.enter_position('long')
                     
-        elif fs_cross_down:
-            cond_entry = abs(self.current_rsi_value - 50) > SHORT_RSI_ENTRY_LEVEL
-            cond_entry_fs = max(abs(tr_now), abs(fs_now)) < SHORT_FS_ENTRY_LEVEL
-            cond_vol = self.current_vol_os > 0
+        elif bearish_cross:
+            entry_condition = abs(self.rsi_current - 50) > SHORT_RSI_THRESHOLD
+            fs_condition = max(abs(trigger_current), abs(fisher_current)) < SHORT_FS_THRESHOLD
+            volume_condition = self.volume_osc > 0
             
-            print(f"[SIGNAL] SHORT Conditions - RSI: {cond_entry}, FS: {cond_entry_fs}, VOL: {cond_vol}")
+            print(f"SHORT Conditions - RSI: {entry_condition}, FS: {fs_condition}, VOL: {volume_condition}")
             
-            if cond_entry and cond_entry_fs and cond_vol:
-                if self.current_short_position:
-                    if current_price > self.current_short_position['entry_price']:
-                        self.close_position('short', "Replace")
-                        self.open_position('short')
+            if entry_condition and fs_condition and volume_condition:
+                if self.active_short:
+                    if current_quote > self.active_short['entry_price']:
+                        self.exit_position('short', "Replace")
+                        self.enter_position('short')
                     else:
                         pass
                 else:
-                    self.open_position('short')
+                    self.enter_position('short')
 
-    def open_position(self, direction):
-        with self.trade_lock:
-            if direction == 'long' and self.current_long_position:
-                print("[TRADE] Cannot open LONG: an open LONG position already exists.")
+    def enter_position(self, side):
+        with self.execution_lock:
+            if side == 'long' and self.active_long:
+                print("Cannot open LONG: an open LONG position already exists")
                 return
-            if direction == 'short' and self.current_short_position:
-                print("[TRADE] Cannot open SHORT: an open SHORT position already exists.")
+            if side == 'short' and self.active_short:
+                print("Cannot open SHORT: an open SHORT position already exists")
                 return
         
-            price = self.get_current_price()
-            if price is None:
-                print("[TRADE] Failed to fetch current price for open position.")
+            quote = self.fetch_latest_quote()
+            if quote is None:
+                print("Failed to fetch current price for open position")
                 return
             
-            size = round((6000 * LEVERAGE) / price, 4)
+            quantity = round((6000 * MULTIPLIER) / quote, 4)
 
-            current_time = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+            timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-            if direction == 'long':
-                stop_loss_level = LONG_STOP_LOSS_LEVEL
-                take_profit_level = LONG_TAKE_PROFIT_LEVEL
+            if side == 'long':
+                sl_multiplier = LONG_SL_MULTIPLIER
+                tp_multiplier = LONG_TP_MULTIPLIER
             else:
-                stop_loss_level = SHORT_STOP_LOSS_LEVEL
-                take_profit_level = SHORT_TAKE_PROFIT_LEVEL
+                sl_multiplier = SHORT_SL_MULTIPLIER
+                tp_multiplier = SHORT_TP_MULTIPLIER
 
-            initial_risk = self.current_atr_value * stop_loss_level
-            initial_profit = self.current_atr_value * take_profit_level
+            risk_amount = self.atr_current * sl_multiplier
+            profit_target = self.atr_current * tp_multiplier
 
-            if direction == 'long':
-                stop_loss = price - initial_risk
-                take_profit = price + initial_profit 
+            if side == 'long':
+                stop_price = quote - risk_amount
+                target_price = quote + profit_target 
 
             else:
-                stop_loss = price + initial_risk
-                take_profit = price - initial_profit
+                stop_price = quote + risk_amount
+                target_price = quote - profit_target
 
-
-            trade = {
-                'entry_time': current_time,
+            order = {
+                'entry_time': timestamp,
                 'exit_time': None,
-                'action': direction,
-                'entry_price': price,
+                'action': side,
+                'entry_price': quote,
                 'exit_price': None,
-                'size': size,
+                'size': quantity,
                 'status': 'open',
                 'pnl': 0.0,
                 'fee': 0.0,
                 'ideal_pnl': 0.0,
                 'reason': '',
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'max_profit_price': price,
+                'stop_loss': stop_price,
+                'take_profit': target_price,
+                'max_profit_price': quote,
                 'trailing_stop_active': False,
                 'half_exit_done': False,
-                'original_size': size
+                'original_size': quantity
             }
             
-            self.send_webhook(direction, price, size)
+            self.notify_webhook(side, quote, quantity)
 
-            if direction == 'long':
-                self.current_long_position = trade
+            if side == 'long':
+                self.active_long = order
             else:
-                self.current_short_position = trade
+                self.active_short = order
 
-            self.trades.append(trade)
-            self.save_trades()
-            print(f"[TRADE] 🟢 Opened {direction.upper()} position at ${price:.4f}, size: {size:.4f}, SL: ${stop_loss:.4f}")
+            self.trade_history.append(order)
+            self.persist_trades()
+            print(f"Opened {side.upper()} position at ${quote:.4f}, size: {quantity:.4f}, SL: ${stop_price:.4f}")
 
-    def close_trade(self, trade, current_price, reason):
-        with self.trade_lock:
-            trade['exit_time'] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-            trade['exit_price'] = current_price
+    def finalize_trade(self, order, current_quote, reason):
+        with self.execution_lock:
+            order['exit_time'] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+            order['exit_price'] = current_quote
             
-            if trade['action'] == 'long':
-                trade['pnl'] = (current_price - trade['entry_price']) * trade['size']
+            if order['action'] == 'long':
+                order['pnl'] = (current_quote - order['entry_price']) * order['size']
             else:
-                trade['pnl'] = (trade['entry_price'] - current_price) * trade['size']
+                order['pnl'] = (order['entry_price'] - current_quote) * order['size']
                 
-            trade['fee'] = (current_price + trade['entry_price']) * FEE_PERCENT * trade['size']
-            trade['ideal_pnl'] = trade['pnl']
-            trade['pnl'] -= trade['fee']
-            self.balance += trade['pnl']
-            trade['status'] = 'closed'
-            trade['reason'] = reason
+            order['fee'] = (current_quote + order['entry_price']) * TRANSACTION_FEE * order['size']
+            order['ideal_pnl'] = order['pnl']
+            order['pnl'] -= order['fee']
+            self.account_balance += order['pnl']
+            order['status'] = 'closed'
+            order['reason'] = reason
             
-            if trade['action'] == 'long':
-                self.current_long_position = None
+            if order['action'] == 'long':
+                self.active_long = None
             else:
-                self.current_short_position = None
+                self.active_short = None
 
-            self.send_webhook(f'exit_{trade["action"]}', current_price, trade['size'], 100)
-            self.save_trades()
+            self.notify_webhook(f'exit_{order["action"]}', current_quote, order['size'], 100)
+            self.persist_trades()
             
-            print(f"[TRADE] 🔴 Closed {trade['action'].upper()} position | "
-                  f"Entry: ${trade['entry_price']:.4f} | "
-                  f"Exit: ${current_price:.4f} | "
-                  f"PNL: ${trade['pnl']:.4f} (Fee: ${trade['fee']:.4f}) | "
-                  f"Reason: {reason}")
+            print(f"Closed {order['action']} position")
             
-            self.send_daily_pnl_signal()
+            self.broadcast_performance()
 
-    def close_position(self, direction, reason="signal"):
-        if direction == 'long' and self.current_long_position:
-            position = self.current_long_position
-        elif direction == 'short' and self.current_short_position:
-            position = self.current_short_position
+    def exit_position(self, side, reason="signal"):
+        if side == 'long' and self.active_long:
+            holding = self.active_long
+        elif side == 'short' and self.active_short:
+            holding = self.active_short
         else:
-            print(f"[TRADE] No open {direction.upper()} positions to close 🤷‍♂️")
+            print(f"No open {side.upper()} positions to close 🤷‍♂️")
             return
             
-        current_price = self.get_current_price()
-        if current_price is None:
-            print("[TRADE] Failed to fetch current price for closing positions")
+        current_quote = self.fetch_latest_quote()
+        if current_quote is None:
+            print("Failed to fetch current price for closing positions")
             return
 
-        self.close_trade(position, current_price, reason)
+        self.finalize_trade(holding, current_quote, reason)
 
-    def close_half_position(self, direction):
-        """Manually close half of the position"""
-        if direction == 'long' and self.current_long_position:
-            position = self.current_long_position
-        elif direction == 'short' and self.current_short_position:
-            position = self.current_short_position
+    def partial_exit(self, side):
+        if side == 'long' and self.active_long:
+            holding = self.active_long
+        elif side == 'short' and self.active_short:
+            holding = self.active_short
         else:
-            print(f"[HALF EXIT] No open {direction.upper()} positions to close half 🤷‍♂️")
+            print(f"No open {side.upper()} positions to close half")
             return
 
-        if position.get('half_exit_done', False):
-            print(f"[HALF EXIT] Half exit already executed for {direction.upper()} position")
+        if holding.get('half_exit_done', False):
+            print(f"Half exit already executed for {side.upper()} position")
             return
 
-        current_price = self.get_current_price()
-        if current_price is None:
-            print("[HALF EXIT] Failed to fetch current price")
+        current_quote = self.fetch_latest_quote()
+        if current_quote is None:
+            print("Failed to fetch current price")
             return
 
-        self.execute_half_exit(position, current_price)
+        self.partial_close(holding, current_quote)
 
-    # ========== Risk Management ==========
-    def monitor_positions(self):
-        print("[MONITOR] Starting real-time position monitoring (every 1s)...")
-        while self.running:
+    def watch_positions(self):
+        print("Starting real-time position monitoring (every 1s)...")
+        while self.is_active:
             try:
-                current_price = self.get_current_price()
-                if current_price:
-                    self.check_risk(current_price)
+                current_quote = self.fetch_latest_quote()
+                if current_quote:
+                    self.evaluate_risk(current_quote)
                 else:
-                    print("[MONITOR] Skipping — price unavailable")
+                    print("Skipping — price unavailable")
                 
-                # Sleep exactly 1 second before next check
                 time.sleep(1)
 
             except Exception as e:
-                print(f"[MONITOR] Error: {e}")
+                print(f"Error: {e}")
                 time.sleep(1)
 
-    def check_risk(self, current_price):
+    def evaluate_risk(self, current_quote):
         
-        if self.current_long_position:
-            self.update_trailing_stop(current_price, self.current_long_position)
-        if self.current_short_position:
-            self.update_trailing_stop(current_price, self.current_short_position)
+        if self.active_long:
+            self.adjust_trailing_sl(current_quote, self.active_long)
+        if self.active_short:
+            self.adjust_trailing_sl(current_quote, self.active_short)
 
-        # Check long position
-        if self.current_long_position:
-            position = self.current_long_position
-            if current_price <= position['stop_loss']:
-                print(f"[RISK] Stop loss hit for LONG: ${current_price:.4f} <= ${position['stop_loss']:.4f}")
-                self.close_trade(position, current_price, "stop_loss")
+        if self.active_long:
+            holding = self.active_long
+            if current_quote <= holding['stop_loss']:
+                print(f"Stop loss hit for LONG: ${current_quote:.4f} <= ${holding['stop_loss']:.4f}")
+                self.finalize_trade(holding, current_quote, "stop_loss")
                 return
 
-        # Check short position  
-        if self.current_short_position:
-            position = self.current_short_position
-            if current_price >= position['stop_loss']:
-                print(f"[RISK] Stop loss hit for SHORT: ${current_price:.4f} >= ${position['stop_loss']:.4f}")
-                self.close_trade(position, current_price, "stop_loss")
+        if self.active_short:
+            holding = self.active_short
+            if current_quote >= holding['stop_loss']:
+                print(f"Stop loss hit for SHORT: ${current_quote:.4f} >= ${holding['stop_loss']:.4f}")
+                self.finalize_trade(holding, current_quote, "stop_loss")
                 return
 
-    def send_daily_pnl_signal(self):
-        """Send a performance summary webhook each time a trade is closed"""
-        if not self.trades:
+    def broadcast_performance(self):
+        if not self.trade_history:
             return
 
-        df = pd.DataFrame(self.trades)
+        dataframe = pd.DataFrame(self.trade_history)
 
-        # Use only closed trades
-        closed = df[df['status'] == 'closed'].copy()
+        completed_trades = dataframe[dataframe['status'] == 'closed'].copy()
 
-        last_position_size = closed['size'].iloc[-1] if not closed.empty else 0.0
-        last_position_entry_price = closed['entry_price'].iloc[-1] if not closed.empty else 0.0
+        last_position_size = completed_trades['size'].iloc[-1] if not completed_trades.empty else 0.0
+        last_position_entry_price = completed_trades['entry_price'].iloc[-1] if not completed_trades.empty else 0.0
         last_position_usdt = last_position_size * last_position_entry_price
 
-        if closed.empty:
+        if completed_trades.empty:
             return
 
-        # Convert timestamps
-        closed['exit_time'] = pd.to_datetime(closed['exit_time'], errors='coerce')
-        closed['date'] = closed['exit_time'].dt.strftime('%m-%d')
+        completed_trades['exit_time'] = pd.to_datetime(completed_trades['exit_time'], errors='coerce')
+        completed_trades['date'] = completed_trades['exit_time'].dt.strftime('%m-%d')
 
-        # Calculate total PNLs
-        closed['pnl'] = closed['pnl'].astype(float)
-        daily_pnl = closed.groupby('date')['pnl'].sum().reset_index()
+        completed_trades['pnl'] = completed_trades['pnl'].astype(float)
+        daily_performance = completed_trades.groupby('date')['pnl'].sum().reset_index()
 
-        daily_pnl = daily_pnl.sort_values('date', ascending=False)
+        daily_performance = daily_performance.sort_values('date', ascending=False)
 
-        # Today's date (UTC)
         today_str = datetime.now(timezone.utc).strftime('%m-%d')
-        today_pnl = daily_pnl[daily_pnl['date'] == today_str]['pnl'].sum() if today_str in daily_pnl['date'].values else 0.0
+        today_pnl = daily_performance[daily_performance['date'] == today_str]['pnl'].sum() if today_str in daily_performance['date'].values else 0.0
 
-        # Compute win rate
-        total_trades = len(closed)
-        wins = (closed['pnl'] > 0).sum()
-        winrate = (wins / total_trades) * 100 if total_trades > 0 else 0
+        trade_count = len(completed_trades)
+        winning_trades = (completed_trades['pnl'] > 0).sum()
+        win_rate = (winning_trades / trade_count) * 100 if trade_count > 0 else 0
 
-        # CORRECTED: Max drawdown calculation
-        # Calculate equity curve including initial balance
-        closed_sorted = closed.sort_values('exit_time')
-        cumulative_pnl = closed_sorted['pnl'].cumsum()
-        equity_curve = INITIAL_BALANCE + cumulative_pnl
+        completed_trades_sorted = completed_trades.sort_values('exit_time')
+        cumulative_profit = completed_trades_sorted['pnl'].cumsum()
+        account_equity = STARTING_CAPITAL + cumulative_profit
         
-        total_pnl = closed['pnl'].sum()
-        total_pnl_percent = (total_pnl / INITIAL_BALANCE) * 100 if INITIAL_BALANCE != 0 else 0.0
+        total_profit = completed_trades['pnl'].sum()
+        total_return_pct = (total_profit / STARTING_CAPITAL) * 100 if STARTING_CAPITAL != 0 else 0.0
 
-        # Calculate running maximum
-        running_max = equity_curve.expanding().max()
+        peak_equity = account_equity.expanding().max()
         
-        # Calculate drawdown
-        drawdown = (equity_curve - running_max) / running_max * 100
+        dd_percentage = (account_equity - peak_equity) / peak_equity * 100
         
-        # Get maximum drawdown (most negative)
-        max_drawdown_pct = drawdown.min() if not drawdown.empty else 0
+        max_dd_pct = dd_percentage.min() if not dd_percentage.empty else 0
 
-        # History string
-        history_list = [f"{row.date}:{round(row.pnl,2)}" for row in daily_pnl.itertuples()]
-        history_str = "[" + ", ".join(history_list) + "]"
+        daily_list = [f"{row.date}:{round(row.pnl,2)}" for row in daily_performance.itertuples()]
+        daily_string = "[" + ", ".join(daily_list) + "]"
 
-        last_pnl = closed['pnl'].iloc[-1]
-        # last_pnl_percent = (last_pnl / last_position_usdt) * 100 * LEVERAGE if last_position_usdt != 0 else 0.0
+        last_profit = completed_trades['pnl'].iloc[-1]
 
-        payload = {
+        webhook_data = {
             "ticker": "UNI-USDT",
             "action": "stats",
             "time": datetime.now(timezone.utc).isoformat(),
-            "PNL": str(round(total_pnl_percent, 2)),
-            "LastPNL": str(round(last_pnl, 2)),
-            "MaxDraw": str(round(abs(max_drawdown_pct), 2)),
-            "WinRate": str(round(winrate, 2)),
+            "PNL": str(round(total_return_pct, 2)),
+            "LastPNL": str(round(last_profit, 2)),
+            "MaxDraw": str(round(abs(max_dd_pct), 2)),
+            "WinRate": str(round(win_rate, 2)),
             "DailyPNL": str(round(today_pnl, 2)),
             "Strategy": "20251201",
-            "StartDate": self.start_date.strftime("%b %d, %Y"),
-            "historyPNL": history_str,
-            "TotalTrades": str(total_trades)
+            "StartDate": self.launch_date.strftime("%b %d, %Y"),
+            "historyPNL": daily_string,
+            "TotalTrades": str(trade_count)
         }
 
-        print(f"[DAILY PNL🟡] Sending daily PNL report: {payload}")
+        print(f"Sending daily PNL report: {webhook_data}")
 
-        if self.flag_webhook_sent:
+        if self.enable_notifications:
             try:
-                response = requests.post(WEBHOOK_URL, json=payload, timeout=5)
-                if response.ok:
-                    print(f"[DAILY PNL🟢] Sent successfully ({response.status_code})")
+                api_response = requests.post(NOTIFICATION_WEBHOOK, json=webhook_data, timeout=5)
+                if api_response.ok:
+                    print(f"Sent successfully ({api_response.status_code})")
                 else:
-                    print(f"[DAILY PNL🔴] Failed: {response.status_code} {response.reason}")
+                    print(f"Failed: {api_response.status_code} {api_response.reason}")
             except Exception as e:
-                print(f"[DAILY PNL🔴] Error sending report: {e}")
+                print(f"Error sending report: {e}")
 
-    # ========== Utility Methods ==========
-    def send_webhook(self, action, price, size=None, per=None):
-        if action in ["short", "long"]:
-            payload = {
+    def notify_webhook(self, signal_type, quote, quantity=None, percentage=None):
+        if signal_type in ["short", "long"]:
+            webhook_data = {
                 "time": datetime.now(timezone.utc).isoformat(),
-                "ticker": UNIUSDT_SYMBOL,
-                "action": "sell" if action == "short" else "buy",
-                "price": str(round(price, 4)),
+                "ticker": TRADING_PAIR,
+                "action": "sell" if signal_type == "short" else "buy",
+                "price": str(round(quote, 5)),
                 "OrderType": "market",
-                "size": str(round(size, 4)) if size else "",
-                "TotalTrades": str(self.total_trades)
+                "size": str(round(quantity, 4)) if quantity else "",
+                "TotalTrades": str(self.trade_counter)
             }
 
-            self.total_trades += 1
+            self.trade_counter += 1
 
-        elif action in ["exit_short", "exit_long"]:
-            payload = {
+        elif signal_type in ["exit_short", "exit_long"]:
+            webhook_data = {
                 "time": datetime.now(timezone.utc).isoformat(),
-                "ticker": UNIUSDT_SYMBOL,
-                "action": "exit_sell" if action == "exit_short" else "exit_buy",
-                "price": str(round(price, 4)),
+                "ticker": TRADING_PAIR,
+                "action": "exit_sell" if signal_type == "exit_short" else "exit_buy",
+                "price": str(round(quote, 5)),
                 "OrderType": "market",
-                "per": str(round(per, 2)) if per else "",
-                "size": str(round(size, 4)) if size else "",
+                "per": str(round(percentage, 2)) if percentage else "",
+                "size": str(round(quantity, 4)) if quantity else "",
             }
             
         else:
             return
         
-        print(f"[Signal 🟡] Sending: {payload}")
+        print(f"Sending: {webhook_data}")
 
-        if self.flag_webhook_sent:
+        if self.enable_notifications:
             try:
-                response = requests.post(WEBHOOK_URL, json=payload, timeout=5)
-                if response.ok:
-                    print(f"[Signal 🟢] Success: {response.status_code}")
+                api_response = requests.post(NOTIFICATION_WEBHOOK, json=webhook_data, timeout=5)
+                if api_response.ok:
+                    print(f"Success: {api_response.status_code}")
                 else:
-                    print(f"[Signal 🔴] Failed: {response.status_code} {response.reason}")
+                    print(f"Failed: {api_response.status_code} {api_response.reason}")
             except Exception as err:
-                print(f"[Signal 🔴] Error: {err}")
+                print(f"Error: {err}")
             
 
-    def save_trades(self):
+    def persist_trades(self):
         try:
-            with open(CSV_FILE, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['entry_time', 'exit_time', 'action', 'entry_price', 'exit_price', 
+            with open(HISTORY_FILE, 'w', newline='') as file_handle:
+                csv_writer = csv.writer(file_handle)
+                csv_writer.writerow(['entry_time', 'exit_time', 'action', 'entry_price', 'exit_price', 
                                'size', 'status', 'fee', 'ideal_pnl', 'pnl', 'reason', 'stop_loss', 
                                'take_profit', 'max_profit_price', 'trailing_stop_active', 'half_exit_done', 'original_size'])
-                for trade in self.trades:
-                    writer.writerow([
-                        trade['entry_time'],
-                        trade['exit_time'],
-                        trade['action'],
-                        round(trade['entry_price'], 5),
-                        round(trade['exit_price'], 5) if trade['exit_price'] else '',
-                        round(trade['size'], 2),
-                        trade['status'],
-                        round(trade['fee'], 2),
-                        round(trade['ideal_pnl'], 2),
-                        round(trade.get('pnl', 0), 2),
-                        trade['reason'],
-                        round(trade['stop_loss'], 5),
-                        round(trade['take_profit'], 5),
-                        round(trade.get('max_profit_price', 0), 5),
-                        str(trade.get('trailing_stop_active', False)),
-                        str(trade.get('half_exit_done', False)),
-                        round(trade.get('original_size', trade['size']), 2)
+                for order in self.trade_history:
+                    csv_writer.writerow([
+                        order['entry_time'],
+                        order['exit_time'],
+                        order['action'],
+                        round(order['entry_price'], 5),
+                        round(order['exit_price'], 5) if order['exit_price'] else '',
+                        round(order['size'], 2),
+                        order['status'],
+                        round(order['fee'], 2),
+                        round(order['ideal_pnl'], 2),
+                        round(order.get('pnl', 0), 2),
+                        order['reason'],
+                        round(order['stop_loss'], 5),
+                        round(order['take_profit'], 5),
+                        round(order.get('max_profit_price', 0), 5),
+                        str(order.get('trailing_stop_active', False)),
+                        str(order.get('half_exit_done', False)),
+                        round(order.get('original_size', order['size']), 2)
                     ])
-            print(f"[DATA] Saved {len(self.trades)} trades to {CSV_FILE}")
+            print(f"Saved {len(self.trade_history)} trades to {HISTORY_FILE}")
         except Exception as e:
-            print(f"[DATA] Error saving trades: {e}")
+            print(f"Error saving trades: {e}")
 
-    # ========== Command Interface ==========
-    def listen_for_input(self):
-        print('Bot is running... Type "help" for commands')
-        while self.running:
+    def handle_commands(self):
+        print('Bot is running...')
+        while self.is_active:
             try:
-                cmd = input(">> ").lower().strip()
+                command = input(">> ").lower().strip()
 
-                if cmd == 'help':
-                    print("Commands: force open long/short, force close long/short, "
-                          "force half close long/short, balance, positions, price, status, exit")
-                
-                elif cmd == 'force open long':
-                    self.open_position('long')
-                elif cmd == 'force open short':
-                    self.open_position('short')
-                elif cmd == 'force close long':
-                    self.close_position('long')
-                elif cmd == 'force close short':
-                    self.close_position('short')
-                elif cmd == 'force half close long':
-                    self.close_half_position('long')
-                elif cmd == 'force half close short':
-                    self.close_half_position('short')
-                elif cmd == 'balance':
-                    print(f"Current balance: ${self.balance:.4f}")
-                elif cmd == 'price':
-                    print(f"Current price: ${self.get_current_price():.4f}")
-                elif cmd == 'exit':
-                    self.running = False
+                if command == 'force open long':
+                    self.enter_position('long')
+                elif command == 'force open short':
+                    self.enter_position('short')
+                elif command == 'force close long':
+                    self.exit_position('long')
+                elif command == 'force close short':
+                    self.exit_position('short')
+                elif command == 'force half close long':
+                    self.partial_exit('long')
+                elif command == 'force half close short':
+                    self.partial_exit('short')
+                elif command == 'balance':
+                    print(f"Current balance: ${self.account_balance:.4f}")
+                elif command == 'price':
+                    print(f"Current price: ${self.fetch_latest_quote():.4f}")
+                elif command == 'exit':
+                    self.is_active = False
                     print("Shutting down...")
                     break
                 else:
-                    print("Invalid command. Type 'help' for available commands")
+                    print("Invalid command")
             except KeyboardInterrupt:
-                self.running = False
+                self.is_active = False
                 print("Shutting down...")
                 break
             except Exception as e:
                 print(f"Input error: {e}")
 
-    def wait_until_next_hour_plus_5sec(self):
-        now = datetime.now(timezone.utc)
-        current_hour = now.replace(minute=0, second=0, microsecond=0)
+    def schedule_next_cycle(self):
+        current_time = datetime.now(timezone.utc)
+        hour_start = current_time.replace(minute=0, second=0, microsecond=0)
 
-        # Target is the next full hour + 5 seconds
-        next_time = current_hour + timedelta(hours=1, seconds=5)
+        next_cycle = hour_start + timedelta(hours=1, seconds=1)
 
-        # Just in case (if somehow equal/past), push to the following hour
-        if next_time <= now:
-            next_time += timedelta(hours=1)
+        if next_cycle <= current_time:
+            next_cycle += timedelta(hours=1)
 
-        sleep_seconds = (next_time - now).total_seconds()
-        print(f"Sleeping for {sleep_seconds:.4f} seconds until {next_time.strftime('%H:%M:%S')} UTC")
-        time.sleep(sleep_seconds)
+        wait_duration = (next_cycle - current_time).total_seconds()
+        print(f"Sleeping for {wait_duration:.4f} seconds until {next_cycle.strftime('%H:%M:%S')} UTC")
+        time.sleep(wait_duration)
 
-    # ========== Main Loop ==========
-    def strategy_loop(self):
-        print("[STRATEGY] Starting strategy loop")
-        while self.running:
+    def main_loop(self):
+        print("Starting strategy loop")
+        while self.is_active:
             try:
-                current_time = datetime.now(timezone.utc)
-                print(f"\n[STRATEGY] Running strategy check at {current_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-                self.update_indicators()
-                self.check_signal(current_time.strftime('%Y-%m-%d %H:%M:%S'))
-                self.wait_until_next_hour_plus_5sec()
+                timestamp = datetime.now(timezone.utc)
+                print(f"\nRunning strategy check at {timestamp.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                self.refresh_indicators()
+                self.evaluate_signals(timestamp.strftime('%Y-%m-%d %H:%M:%S'))
+                self.schedule_next_cycle()
             except Exception as e:
-                print(f"[STRATEGY] Error in strategy loop: {e}")
+                print(f"Error in strategy loop: {e}")
                 time.sleep(60)
 
 if __name__ == "__main__":
-    bot = AutoTradeBot()
-    bot.listen_for_input()
+    bot = TradingEngine()
+    bot.handle_commands()
