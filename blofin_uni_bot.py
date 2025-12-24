@@ -724,6 +724,7 @@ class AutoTradeBot:
                 "ticker": UNIUSDT_SYMBOL,
                 "action": "sell" if action == "short" else "buy",
                 "price": str(round(price, 4)),
+                "OrderType": "market",
                 "size": str(round(size, 4)) if size else "",
                 "TotalTrades": str(self.total_trades)
             }
@@ -736,6 +737,7 @@ class AutoTradeBot:
                 "ticker": UNIUSDT_SYMBOL,
                 "action": "exit_sell" if action == "exit_short" else "exit_buy",
                 "price": str(round(price, 4)),
+                "OrderType": "market",
                 "per": str(round(per, 2)) if per else "",
                 "size": str(round(size, 4)) if size else "",
             }
@@ -768,20 +770,20 @@ class AutoTradeBot:
                         trade['entry_time'],
                         trade['exit_time'],
                         trade['action'],
-                        round(trade['entry_price'], 4),
-                        round(trade['exit_price'], 4) if trade['exit_price'] else '',
-                        round(trade['size'], 4),
+                        round(trade['entry_price'], 5),
+                        round(trade['exit_price'], 5) if trade['exit_price'] else '',
+                        round(trade['size'], 2),
                         trade['status'],
-                        round(trade['fee'], 4),
-                        round(trade['ideal_pnl'], 4),
-                        round(trade.get('pnl', 0), 4),
+                        round(trade['fee'], 2),
+                        round(trade['ideal_pnl'], 2),
+                        round(trade.get('pnl', 0), 2),
                         trade['reason'],
-                        round(trade['stop_loss'], 4),
-                        round(trade['take_profit'], 4),
-                        round(trade.get('max_profit_price', 0), 4),
+                        round(trade['stop_loss'], 5),
+                        round(trade['take_profit'], 5),
+                        round(trade.get('max_profit_price', 0), 5),
                         str(trade.get('trailing_stop_active', False)),
                         str(trade.get('half_exit_done', False)),
-                        round(trade.get('original_size', trade['size']), 4)
+                        round(trade.get('original_size', trade['size']), 2)
                     ])
             print(f"[DATA] Saved {len(self.trades)} trades to {CSV_FILE}")
         except Exception as e:
