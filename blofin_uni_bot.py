@@ -23,17 +23,18 @@ TRANSACTION_FEE = 0.0006
 ATR_PERIOD = 14
 FS_PERIOD = 10
 RSI_PERIOD = 14
+MAX_LOSS = 0.03
 
-LONG_FS_THRESHOLD = 1.1
-LONG_RSI_THRESHOLD = 28.0
-LONG_SL_MULTIPLIER = 2.9
-LONG_TP_MULTIPLIER = 1.1
-LONG_TRAILING_SL_MULTIPLIER = 0.1
+LONG_FS_THRESHOLD = 0.9
+LONG_RSI_THRESHOLD = 2.0
+LONG_SL_MULTIPLIER = 2.8
+LONG_TP_MULTIPLIER = 1.0
+LONG_TRAILING_SL_MULTIPLIER = 0.5
 
-SHORT_FS_THRESHOLD = 4.7
-SHORT_RSI_THRESHOLD = 1.0
-SHORT_SL_MULTIPLIER = 2.9
-SHORT_TP_MULTIPLIER = 2.0
+SHORT_FS_THRESHOLD = 0.7
+SHORT_RSI_THRESHOLD = 28.0
+SHORT_SL_MULTIPLIER = 2.0
+SHORT_TP_MULTIPLIER = 2.3
 SHORT_TRAILING_SL_MULTIPLIER = 0.1
 
 class TradingEngine:
@@ -118,7 +119,6 @@ class TradingEngine:
             for item in response_data['data']:
                 if item['symbol'] == TRADING_PAIR:
                     quote = float(item['lastPr'])
-                    print(f"Fetched price: ${quote:.4f}")
                     return quote
                     
             print(f"Current USDT symbol not found in response")
@@ -387,7 +387,7 @@ class TradingEngine:
             print(f"DOWN cross is detected!")
         
         if bullish_cross:
-            entry_condition = abs(self.rsi_current - 50) < LONG_RSI_THRESHOLD
+            entry_condition = abs(self.rsi_current - 50) > LONG_RSI_THRESHOLD
             fs_condition = max(abs(trigger_current), abs(fisher_current)) < LONG_FS_THRESHOLD
             volume_condition = self.volume_osc > 0
             
@@ -404,8 +404,8 @@ class TradingEngine:
                     self.enter_position('long')
                     
         elif bearish_cross:
-            entry_condition = abs(self.rsi_current - 50) > SHORT_RSI_THRESHOLD
-            fs_condition = max(abs(trigger_current), abs(fisher_current)) < SHORT_FS_THRESHOLD
+            entry_condition = abs(self.rsi_current - 50) < SHORT_RSI_THRESHOLD
+            fs_condition = max(abs(trigger_current), abs(fisher_current)) > SHORT_FS_THRESHOLD
             volume_condition = self.volume_osc > 0
             
             print(f"SHORT Conditions - RSI: {entry_condition}, FS: {fs_condition}, VOL: {volume_condition}")
@@ -428,6 +428,10 @@ class TradingEngine:
             if side == 'short' and self.active_short:
                 print("Cannot open SHORT: an open SHORT position already exists")
                 return
+
+            if datetime.now(timezone.utc).weekday() == 5:
+                print("[TRADE] Skipping open: Saturday filter is enabled.")
+                return
         
             quote = self.fetch_latest_quote()
             if quote is None:
@@ -448,10 +452,12 @@ class TradingEngine:
             risk_amount = self.atr_current * sl_multiplier
             profit_target = self.atr_current * tp_multiplier
 
+            if risk_amount > quote * MAX_LOSS:
+                risk_amount = quote * MAX_LOSS
+
             if side == 'long':
                 stop_price = quote - risk_amount
                 target_price = quote + profit_target 
-
             else:
                 stop_price = quote + risk_amount
                 target_price = quote - profit_target
@@ -605,15 +611,16 @@ class TradingEngine:
             return
 
         completed_trades['exit_time'] = pd.to_datetime(completed_trades['exit_time'], errors='coerce')
-        completed_trades['date'] = completed_trades['exit_time'].dt.strftime('%m-%d')
-
+        completed_trades['full_date'] = completed_trades['exit_time'].dt.date
+        completed_trades['date_str'] = completed_trades['exit_time'].dt.strftime('%m-%d')
         completed_trades['pnl'] = completed_trades['pnl'].astype(float)
-        daily_performance = completed_trades.groupby('date')['pnl'].sum().reset_index()
 
-        daily_performance = daily_performance.sort_values('date', ascending=False)
+        daily_performance = completed_trades.groupby('full_date')['pnl'].sum().reset_index()
+        daily_performance = daily_performance.sort_values('full_date', ascending=False)
+        daily_performance['date_str'] = daily_performance['full_date'].apply(lambda x: x.strftime('%m-%d'))
 
-        today_str = datetime.now(timezone.utc).strftime('%m-%d')
-        today_pnl = daily_performance[daily_performance['date'] == today_str]['pnl'].sum() if today_str in daily_performance['date'].values else 0.0
+        today_full = datetime.now(timezone.utc).date()
+        today_pnl = daily_performance[daily_performance['full_date'] == today_full]['pnl'].sum() if today_full in daily_performance['full_date'].values else 0.0
 
         trade_count = len(completed_trades)
         winning_trades = (completed_trades['pnl'] > 0).sum()
@@ -632,10 +639,10 @@ class TradingEngine:
         
         max_dd_pct = dd_percentage.min() if not dd_percentage.empty else 0
 
-        daily_list = [f"{row.date}:{round(row.pnl,2)}" for row in daily_performance.itertuples()]
+        daily_list = [f"{row.date_str}:{round(row.pnl,2)}" for row in daily_performance.itertuples()]
         daily_string = "[" + ", ".join(daily_list) + "]"
 
-        last_profit = completed_trades['pnl'].iloc[-1]
+        last_profit = completed_trades['pnl'].iloc[-1] if not completed_trades.empty else 0.0
 
         webhook_data = {
             "ticker": "UNI-USDT",
